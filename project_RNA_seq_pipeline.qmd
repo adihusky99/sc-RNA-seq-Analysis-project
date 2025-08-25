@@ -1,0 +1,1023 @@
+---
+title: "RNA-Seq Exploratory Data Analysis"
+author: "Aditya Elayavalli"
+format:
+  html:
+    self-contained: true
+  pdf:
+    toc: true
+    number-sections: true
+---
+
+# Load Libraries
+
+```{r}
+# Your code here
+library(tidyr)
+library(dplyr)
+library(biomaRt)
+library(ggplot2)
+library(patchwork)
+library(DESeq2)
+library(ComplexHeatmap)
+library(scales)
+library(EnhancedVolcano)
+library(ggrepel)
+```
+
+# Prepare Data
+
+```{r}
+# read in the data 
+ccle_counts <- read.csv("/cloud/project/data/CCLE_RNAseq_genes_counts_20180929.gct.gz", header = TRUE, sep = "\t", skip = 2)
+head(ccle_counts,5)
+```
+```{r}
+# structure of the dataset
+str(ccle_counts)
+```
+```{r}
+# column and row statistics
+cat("Number of rows in the dataset:", nrow(ccle_counts))
+cat(" Number of columns in the dataset:", ncol(ccle_counts))
+```
+```{r}
+# checking if there are duplication in the dataset
+cat("There are ",(sum(duplicated(colnames(ccle_counts)))),"duplicated columns.")
+cat("There are ",(sum(duplicated(ccle_counts$Description))),"duplicated rows.")
+```
+In the above code we used colnames as that gives us the column names. However we used the Description column as the gene because multiple Ensembl IDs may map to the same gene symbol. So it is easier to determine if there are any duplicated rows using that column. 
+
+Duplicated rows are actually very common in gene expression data because:
+1) Multiple probe sets can target the same gene
+2) Different transcript variants of the same gene
+3) Alternative gene identifiers pointing to the same gene
+
+However this causes problems in the analysis as when calculating gene expression statistics (means, correlations, differential expression), we would have to avoid counting the same genes multiple times.Genes with multiple entries will effect the overall analysis such as  pathway analysis, gene set enrichment, clustering analysis and PCA. So it is important to remove the duplicated genes from the analysis dataset or simply to combine them.
+
+```{r}
+# Step 1: Extract all rows that have duplicated descriptions (both original and duplicate copies)
+# This finds genes where Description appears more than once in the dataset
+ccle_counts_dupes <- ccle_counts[ccle_counts$Description %in% ccle_counts$Description[duplicated(ccle_counts$Description)], ]
+
+# Step 2: Combine duplicated genes by summing their expression values
+# Groups by Description and sums all numeric columns (expression data) for each gene
+ccle_counts_dupes_summed <- ccle_counts_dupes %>% 
+  group_by(Description) %>% 
+  summarize(across(where(is.numeric), sum))
+
+# Step 3: Extract all rows that appear only once (no duplicates)
+# Uses both duplicated() and duplicated(fromLast=TRUE) to exclude ALL copies of duplicated genes
+# This keeps only genes that have unique descriptions
+ccle_counts_no_duplicates <- ccle_counts[!duplicated(ccle_counts$Description) & 
+                                         !duplicated(ccle_counts$Description, fromLast = TRUE), ]
+
+# Step 4: Combine the unique genes with the summed duplicated genes
+# Creates final dataset with no duplicate gene descriptions
+ccle_counts <- bind_rows(ccle_counts_no_duplicates, ccle_counts_dupes_summed)
+
+head(ccle_counts,5)
+```
+```{r}
+rownames(ccle_counts) <- ccle_counts$Description
+ccle_counts <- ccle_counts[, -1]
+ccle_counts <- ccle_counts[, -1]
+head(ccle_counts,5)
+
+# Connect to the Ensembl database using biomaRt
+# This establishes a connection to the human gene database (Homo sapiens)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Query Ensembl to retrieve information about protein-coding genes
+# getBM() retrieves specific attributes for genes that meet certain criteria
+coding_genes_hgnc <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol', 'gene_biotype'),
+                           filters = 'biotype',           # Filter by gene biotype
+                           values = 'protein_coding',     # Only get protein-coding genes
+                           mart = ensembl)                # Use the Ensembl connection
+
+# Extract just the gene symbols (HGNC symbols) from the query results
+# This creates a vector of protein-coding gene names for filtering
+coding_gene_ids <- coding_genes_hgnc$hgnc_symbol
+
+# Filter the expression data to keep only protein-coding genes
+# This removes non-coding genes (like lncRNAs, miRNAs, etc.) from the dataset
+ccle_counts <- ccle_counts[rownames(ccle_counts) %in% coding_gene_ids, ]
+
+# Convert the result back to a data frame format
+# This ensures the filtered data maintains proper data frame structure
+ccle_counts <- data.frame(ccle_counts)
+
+# Print the filtered dataset to verify the changes
+#head(ccle_counts)
+```
+The larger the counts matrix, the more computational resources are required to work with it. Since I only want to work with protein-coding genes at this point, I will remove all other genes to reduce the size of the counts matrix.
+
+```{r}
+# Connect to the Ensembl database using biomaRt
+# This establishes a connection to the human gene database (Homo sapiens)
+ensembl <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+
+# Query Ensembl to retrieve information about protein-coding genes
+# getBM() retrieves specific attributes for genes that meet certain criteria
+coding_genes_hgnc <- getBM(attributes = c('ensembl_gene_id', 'hgnc_symbol', 'gene_biotype'),
+                           filters = 'biotype',           # Filter by gene biotype
+                           values = 'protein_coding',     # Only get protein-coding genes
+                           mart = ensembl)                # Use the Ensembl connection
+
+# Extract just the gene symbols (HGNC symbols) from the query results
+# This creates a vector of protein-coding gene names for filtering
+coding_gene_ids <- coding_genes_hgnc$hgnc_symbol
+
+# Filter the expression data to keep only protein-coding genes
+# This removes non-coding genes (like lncRNAs, miRNAs, etc.) from the dataset
+ccle_counts <- ccle_counts[rownames(ccle_counts) %in% coding_gene_ids, ]
+
+# Convert the result back to a data frame format
+# This ensures the filtered data maintains proper data frame structure
+ccle_counts <- data.frame(ccle_counts)
+
+# Print the filtered dataset to verify the changes
+head(ccle_counts)
+```
+
+Metadata: In an RNA-seq experiment with n number of  samples, the resulting count matrix will typically contain thousands of rows (each representing a gene) and n number of columns (one for each sample). This structure captures only the raw gene expression data. Additional details such as how the samples were prepared, the tissue or disease they came from, or any mutations observed are not included in the count matrix. Instead, this type of sample-specific information is stored separately as metadata.
+
+When analyzing RNA-seq data, we always rely on two key components: the count matrix and the sample-level metadata. It is important to ensure that the metadata is well-organized and consistently formatted so that information about each sample can be retrieved quickly and accurately in relation to the counts matrix.
+
+In practice, the two datasets are usually kept separate because they hold very different types of information. The count matrix is made up of numerical values representing gene expression, while the metadata primarily contains descriptive or categorical information. Mixing these into one table could complicate calculations or visualizations, and potentially introduce errors in analysis. By storing them separately, we keep the numeric data clean for computation, while still being able to link in the metadata whenever necessary.
+
+```{r}
+ccle_meta <- read.csv("/cloud/project/data/Cell_lines_annotations_20181226.txt", header = TRUE, sep = "\t")
+head(ccle_meta)
+```
+The code chunk belows filters the dataset to keep the columns I believe would be usefull for the analysis. 
+```{r}
+colnames(ccle_meta)
+
+#select columns
+keep_cols <- c(
+  # Core identifiers
+  "CCLE_ID", "Name", 
+  
+  # Sample grouping variables (main biological factors)
+  "Pathology", "Site_Primary", "Histology", "Disease", 
+  "type", "type_refined",
+  
+  # Potential confounding variables (biological)
+  "Gender", "Age", "Race", "inferred_ethnicity",
+  
+  # Technical variables (experimental conditions)
+  "Growth.Medium", "Supplements", "Doubling.Time.Calculated.hrs",
+  
+  # Additional useful variables
+  "Hist_Subtype1", "tcga_code"
+)
+
+ccle_meta <- ccle_meta[, keep_cols]
+
+ccle_meta <- ccle_meta %>%
+  mutate(across(everything(), ~case_when(
+    is.na(.) ~ "missing info",
+    . == "*NA*" ~ "missing info",
+    . == "" ~ "missing info",
+    . == "null" ~ "missing info",  # Added missing tilde and comma
+    TRUE ~ as.character(.)
+  )))
+
+#str(ccle_meta)
+sapply(ccle_meta, function(x) sum(is.na(x)))
+sapply(ccle_meta, function(x) sum(x == "missing info"))
+head(ccle_meta)
+```
+
+```{r}
+print(sum(ccle_meta$CCLE_ID %in% colnames(ccle_counts)))
+all(ccle_meta$CCLE_ID == colnames(ccle_counts))
+
+ccle_counts <- ccle_counts[, colnames(ccle_counts) %in% ccle_meta$CCLE_ID]
+
+ccle_meta <- ccle_meta[ccle_meta$CCLE_ID %in% colnames(ccle_counts), ]
+
+ccle_counts <- ccle_counts[, ccle_meta$CCLE_ID]
+```
+```{r}
+nrow(ccle_meta)
+ncol(ccle_counts)
+```
+The below code chunk chooses the cell line we are going to use for the analysis. I have chosen the central_nervous_system for this project because I have recently come across studies related to it and would like to see how to apply what I learnt to the topic. 
+```{r}
+unique(ccle_meta$Site_Primary)
+selected <- ccle_meta$Site_Primary %in% c("central_nervous_system")
+ccle_counts_subset <- ccle_counts[,selected]
+ccle_meta_subset <- ccle_meta[selected,]
+
+unique(ccle_meta_subset$Pathology)
+selected_2 <- ccle_meta_subset$Pathology!= ""
+ccle_counts_subset <- ccle_counts_subset[,selected_2]
+ccle_meta_subset <- ccle_meta_subset[selected_2,]
+
+nrow(ccle_meta_subset)
+ncol(ccle_counts_subset)
+
+write.csv(ccle_counts, "/cloud/project/outs/project_ccle_counts.csv")
+write.csv(ccle_meta, "/cloud/project/outs/project_ccle_meta.csv", row.names = FALSE)
+
+write.csv(ccle_counts_subset, "/cloud/project/outs/project_ccle_counts_subset.csv")
+write.csv(ccle_meta_subset, "/cloud/project/outs/project_ccle_meta_subset.csv", row.names = FALSE)
+```
+The 2 code chunk below is a basic practice of reading in a file. 
+```{r}
+ccle_counts_subset <- read.csv("/cloud/project/outs/project_ccle_counts_subset.csv")
+row.names(ccle_counts_subset) <- ccle_counts_subset[, 1]
+ccle_counts_subset$X <- NULL
+head(ccle_counts_subset)
+```
+```{r}
+# Your code here
+ccle_meta_subset <- read.csv("/cloud/project/outs/project_ccle_meta_subset.csv")
+#head(ccle_meta_subset)
+```
+
+
+This code chunk is performing the initial steps of a differential gene expression analysis using the DESeq2 package in R. We create a DESeqDataSet object, which is the main data structure for DESeq2 analysis. It combines:
+
+countData: Gene expression count matrix (genes as rows, samples as columns)
+colData: Sample metadata containing information about each sample
+design: The experimental design formula (~ Pathology) indicating that the analysis will compare gene expression across different pathology groups
+
+We then filter genes with very low expression by keeping only genes that have at least 100 total counts across all samples. This filtering step improves statistical power by removing noise from lowly expressed genes and then apply a variance stabilizing transformation to the count data. The transformation:
+
+Reduces the dependence of variance on the mean count value
+Makes the data more suitable for downstream analyses like PCA, clustering, or heatmaps
+Produces log2-like values that are easier to work with for visualization
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = data.frame(ccle_counts_subset),
+                              colData = ccle_meta_subset,
+                              design = ~ Pathology)
+
+dds <- dds[rowSums(counts(dds)) >= 100, ] 
+
+vsd <- vst(dds)
+```
+The below code chunk creates a mean gene expression-vs-variance scatter plot for raw counts as well as for variance-stabilized counts.
+```{r}
+# Your code here
+raw_counts <- counts(dds)
+vsd_counts <- assay(vsd)
+raw_mean <- rowMeans(raw_counts)
+
+df_plot <- data.frame(
+  Mean_Raw = raw_mean,
+  Variance_Raw = apply(raw_counts, 1, var),
+  Mean_VST = rowMeans(vsd_counts),
+  Variance_VST = apply(vsd_counts,1,var)
+)
+# Scatter plot: Raw counts (mean vs. variance)
+raw_plot <- ggplot(df_plot, aes(x = Mean_Raw, y = Variance_Raw)) +
+geom_point(alpha = 0.2, size = 0.1) +
+scale_x_log10() +
+scale_y_log10() +
+labs(
+title = "Raw ",
+x = "log10(mean expression)",
+y = "log10(variance)"
+) +
+theme_minimal() +
+theme(legend.position = "none")
+
+# Scatter plot: Variance-stabilized counts (mean vs. variance)
+vsd_plot <- ggplot(df_plot, aes(x = Mean_VST, y = Variance_VST)) +
+geom_point(alpha = 0.2, size = 0.1) +
+scale_x_log10() +
+scale_y_log10() +
+labs(
+title = "VST ",
+x = "log10(mean expression)",
+y = "log10(variance)"
+) +
+theme_minimal() +
+theme(legend.position = "none")
+
+raw_plot + vsd_plot
+```
+The raw count data displays a strong positive correlation between mean expression and variance when plotted on logarithmic scales, with highly expressed genes exhibiting substantially greater variance as anticipated in RNA-seq data. After applying VST, the variance becomes much more uniform across different expression levels, creating a more stabilized pattern. While some dependency between mean and variance persists following transformation, it is considerably reduced and creates a more statistically manageable dataset.
+
+
+The below code chunk visualizes raw versus variance-stabilized counts in another away to understand intuitively what VST has done. We can determine if VST is reducing or increasing the variance of both highly and lowly expressed genes.
+```{r}
+# Select a small subset of highly expressed genes around the 80th percentile
+percentile_a <- quantile(raw_mean, 0.799)
+percentile_b <- quantile(raw_mean, 0.801)
+high_genes <- names(raw_mean[raw_mean >= percentile_a & raw_mean < percentile_b])
+cat("High genes:", high_genes)
+
+high_raw_counts <- raw_counts[high_genes, ]
+high_vst_counts <- vsd_counts[high_genes, ]
+
+boxplot_data <- data.frame(
+  Gene = rep(high_genes, each = ncol(raw_counts)),
+  Sample = rep(colnames(raw_counts), length(high_genes)),
+  Raw_Counts = as.vector(high_raw_counts),
+  VST_Counts = as.vector(high_vst_counts)
+)
+
+boxplot_long <- boxplot_data %>%
+  pivot_longer(cols = c(Raw_Counts, VST_Counts), 
+               names_to = "Count_Type", 
+               values_to = "Expression_Value")
+
+p_boxplot <- ggplot(boxplot_long, aes(x = Count_Type, y = Expression_Value, fill = Count_Type)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.7) +
+  geom_jitter(width = 0.25, alpha = 0.4, size = 0.8) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Raw_Counts" = "red", "VST_Counts" = "purple")) +
+  labs(
+    title = "Expression Levels: Raw vs VST Counts for Highly Expressed Genes",
+    x = "Count Type",
+    y = "log10(Expression Level)",
+    subtitle = paste("Comparison across", length(high_genes), "highly expressed genes")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray60"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(size = 11)
+  )
+
+p_boxplot
+
+percentile_c <- quantile(raw_mean, 0.199)
+percentile_d <- quantile(raw_mean, 0.201)
+low_genes <- names(raw_mean[raw_mean >= percentile_c & raw_mean < percentile_d])
+cat("
+Low genes:", low_genes)
+
+low_raw_counts <- raw_counts[low_genes, ]
+low_vst_counts <- vsd_counts[low_genes, ]
+
+boxplot_data2 <- data.frame(
+  Gene = rep(low_genes, each = ncol(raw_counts)),
+  Sample = rep(colnames(raw_counts), length(low_genes)),
+  Raw_Counts = as.vector(low_raw_counts),
+  VST_Counts = as.vector(low_vst_counts)
+)
+
+boxplot_long2 <- boxplot_data2 %>%
+  pivot_longer(cols = c(Raw_Counts, VST_Counts), 
+               names_to = "Count_Type", 
+               values_to = "Expression_Value")
+
+p_boxplot2 <- ggplot(boxplot_long2, aes(x = Count_Type, y = Expression_Value, fill = Count_Type)) +
+  geom_boxplot(outlier.shape = NA, width = 0.6, alpha = 0.7) +
+  geom_jitter(width = 0.25, alpha = 0.4, size = 0.8) +
+  scale_y_log10() +
+  scale_fill_manual(values = c("Raw_Counts" = "red", "VST_Counts" = "purple")) +
+  labs(
+    title = "Expression Levels: Raw vs VST Counts for Lowly Expressed Genes",
+    x = "Count Type",
+    y = "log10(Expression Level)",
+    subtitle = paste("Comparison across", length(low_genes), "lowly expressed genes")
+  ) +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    plot.title = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 11, color = "gray60"),
+    axis.title = element_text(size = 12),
+    axis.text.x = element_text(size = 11)
+  )
+
+p_boxplot2
+```
+Based on the plots we can see that VST is infact reducing the variance. This is expected as the variance stabilizing transformation uses a specific mathematical function which is related to the inverse hyperbolic sine that compresses larger values more than smaller ones. This compression inherently reduces the spread  of highly expressed genes while having less effect on lowly expressed genes. Secondly, raw RNA-seq counts follow a negative binomial distribution where variance scales with the mean. VST applies a transformation that counteracts this relationship, effectively "shrinking" the variance of high-count genes toward the variance level of moderate-count genes. While a simple log transformation would compress the range, VST goes further by applying additional stabilization that specifically targets the variance component. It's designed to make the variance approximately constant across expression levels. VST incorporates information from all genes to estimate the mean-variance relationship, then applies a transformation that regularizes  individual gene variances toward a more stable level. 
+
+
+# Principal Component Analysis
+
+The below code will provide me PCA visualization. 
+
+```{r}
+# Your code here
+plotPCA(vsd, intgroup = "Pathology", ntop = 500)
+
+
+# PCA Analysis of High-Variance Genes
+# This code performs Principal Component Analysis on RNA-seq data to visualize sample relationships
+
+# Step 1: Calculate gene-wise variance across all samples
+# rowVars() computes variance for each gene (row) across samples (columns)
+variances <- rowVars(assay(vsd))
+
+# Step 2: Select top 500 most variable genes
+# order() with decreasing=TRUE ranks genes by variance (highest first)
+# [1:500] selects the indices of the top 500 most variable genes
+top_var_genes <- order(variances, decreasing = TRUE)[1:500]
+
+# Step 3: Extract expression matrix for high-variance genes only
+# Subset the variance-stabilized data (vsd) to include only top variable genes
+# This reduces noise and focuses on genes that differ most between samples
+high_var_mat <- assay(vsd)[top_var_genes,]
+
+# Step 4: Perform Principal Component Analysis
+# t() transposes matrix so samples are rows and genes are columns (required for prcomp)
+# center=TRUE: centers each gene to mean=0 (standard for PCA)
+# scale=FALSE: doesn't scale to unit variance (common for RNA-seq after VST)
+pca_res <- prcomp(t(high_var_mat), center = TRUE, scale = FALSE)
+
+# Step 5: Calculate proportion of variance explained by each PC
+# sdev^2 gives eigenvalues (variance of each PC)
+# Divide by sum and multiply by 100 to get percentages
+explained_variance <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+
+# Step 6: Create data frame for plotting
+# Extract PC1 and PC2 coordinates for each sample
+# Combine with sample metadata for coloring/grouping
+df_pca <- data.frame(PC1 = pca_res$x[, 1], 
+                     PC2 = pca_res$x[, 2], 
+                     ccle_meta_subset)
+
+# Step 7: Generate PCA plot
+# Color points by Pathology (tissue/cancer type)
+# Include variance explained in axis labels
+ggplot(df_pca, aes(x = PC1, y = PC2, color = Pathology)) +
+  geom_point(size = 3, alpha = 0.5) +  # Semi-transparent points for overlaps
+  theme_classic() +                      # Clean theme without grid lines
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"))
+
+# Purpose: This analysis reduces high-dimensional gene expression data to 2D visualization
+# Shows which samples are similar (cluster together) based on expression patterns
+# Useful for identifying batch effects, sample relationships, and outliers
+
+df_pca2 <- data.frame(PC3 = pca_res$x[, 3], 
+                     PC4 = pca_res$x[, 4], 
+                     ccle_meta_subset)
+
+# Step 7: Generate PCA plot
+# Color points by Pathology (tissue/cancer type)
+# Include variance explained in axis labels
+ggplot(df_pca2, aes(x = PC3, y = PC4, color = Pathology)) +
+  geom_point(size = 3, alpha = 0.5) +  # Semi-transparent points for overlaps
+  theme_classic() +                      # Clean theme without grid lines
+  labs(x = paste0("PC3: ", round(explained_variance[3], 2), "% variance"), 
+       y = paste0("PC4: ", round(explained_variance[4], 2), "% variance"))
+```
+```{r}
+# Create a data frame for plotting the explained variance
+# This combines PC numbers (1-25) with their corresponding variance values
+df_variance <- data.frame(
+  PC = seq_len(25),                    # Generate sequence 1, 2, 3, ..., 25 for PC numbers
+  Variance = explained_variance[1:25]  # Extract first 25 values from explained_variance vector
+)
+
+# Create the elbow plot using ggplot2
+ggplot(df_variance, aes(x = PC, y = Variance)) +
+  geom_point(size = 2) +              # Add scatter points with size 2
+  theme_minimal() +                   # Apply clean, minimal theme (removes grid backgrounds)
+  labs(                               # Add labels to the plot
+    title = "Elbow Plot (Top 25 PCs)", 
+    x = "Principal Component", 
+    y = "Explained Variance (%)"
+  )
+```
+The biological difference between primary and metastatic samples doesn't appear to dominate the variance. PC1 captures the largest source of variation (31%) but doesn't cleanly separate the two pathology types. This could suggest that other factors (batch effects, individual patient differences, or technical variation) might be contributing significantly to the variance, or that the gene expression differences between primary and metastatic samples are more subtle than other sources of variation in the data.
+
+
+The below code chunk compares whether the  lines segregate by any other column
+
+```{r}
+#head(ccle_meta_subset)
+# encoding age
+encode_age <- function(ages) {
+  # Convert ages to numeric if they aren't already
+  ages <- as.numeric(ages)
+  
+  # Create age groups: 0-9=0, 10-19=1, 20-29=2, etc.
+  age_groups <- floor(ages / 10)
+  
+  # Handle any NA values
+  age_groups[is.na(ages)] <- NA
+  
+  return(age_groups)
+}
+
+vsd_age <- vsd
+colData(vsd_age)$Age_encoded <- encode_age(colData(vsd)$Age)
+
+# Plot with labeled age groups
+plotPCA(vsd_age, intgroup = "Age_encoded", ntop = 500)
+plotPCA(vsd_age, intgroup = "Race", ntop = 500)
+plotPCA(vsd_age, intgroup = "Gender", ntop = 500)
+plotPCA(vsd_age, intgroup = c("tcga_code"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Age_encoded", "Pathology"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Age_encoded", "Race"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Age_encoded", "Gender"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Age_encoded", "tcga_code"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Pathology", "Race"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Pathology", "Gender"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Pathology", "tcga_code"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Race", "Gender"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Race", "tcga_code"), ntop = 500)
+plotPCA(vsd_age, intgroup = c("Gender", "tcga_code"), ntop = 500)
+```
+
+
+The below code chunks provides us analysis for pc1 and pc2
+
+```{r, results='hide'}
+as.data.frame(pca_res$rotation)
+```
+
+```{r}
+pc1_loadings <- pca_res$rotation[, 1]
+pc1_sorted_loadings <- sort(pc1_loadings, decreasing = TRUE)
+head(pc1_sorted_loadings, n = 6)
+
+pc1_loadings <- pca_res$rotation[, 1]
+pc1_sorted_loadings <- sort(pc1_loadings, decreasing = TRUE)
+pc1_top_genes <- names(head(pc1_sorted_loadings, n = 6))
+pc1_top_genes_vsd <- data.frame(t(assay(vsd)[pc1_top_genes, ]))
+
+df_long <- pc1_top_genes_vsd %>%
+pivot_longer(
+cols = everything(),
+names_to = "Gene",
+values_to = "Expression"
+)
+
+ggplot(df_long, aes(x = Gene, y = Expression)) +
+geom_boxplot(aes(fill = Gene), alpha = 0.5) +
+geom_jitter(width = 0.2, size = 1, alpha = 0.5) +
+scale_y_continuous(limits = c(0, 21)) +
+labs(title = "Expression of Top Genes in PC1",
+x = "Genes",
+y = "Expression") +
+theme_classic() +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pc1_loadings <- pca_res$rotation[, 1]
+pc1_sorted_loadings <- sort(pc1_loadings, decreasing = TRUE)
+pc1_top_genes <- names(head(pc1_sorted_loadings, n = 6))
+pc1_top_genes_vsd <- data.frame(t(assay(vsd)[pc1_top_genes, ]))
+
+df_genes_long <- data.frame(
+  pc1_top_genes_vsd,  
+  df_pca[, c("PC1", "PC2", "Pathology")]
+)
+
+
+df_long <- df_genes_long %>%
+  pivot_longer(
+    cols = all_of(pc1_top_genes),  # Only pivot the gene columns
+    names_to = "Gene",
+    values_to = "Expression"
+  )
+
+df_long$Expression_cat <- cut(df_long$Expression, 
+                             breaks = quantile(df_long$Expression, c(0, 0.33, 0.66, 1)), 
+                             labels = c("Low", "Medium", "High"))
+
+ggplot(df_long, aes(x = PC1, y = PC2, size = Expression, color = Expression_cat)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Low" = "#440154", "Medium" = "#21908C", "High" = "#FDE725")) +
+  scale_size_continuous(range = c(1, 4)) +
+  facet_wrap(~ Gene, ncol = 2) +
+  labs(title = "Gene Expression Bubbles in PC Space",
+       x = "PC1", y = "PC2", color = "Expression Level") +
+  theme_minimal()
+```
+COL1A1: Encodes type I collagen, a major structural protein in connective tissue. Overexpression is often linked to fibrosis and tumor progression, where it supports invasive growth and extracellular matrix (ECM) remodeling.
+
+COL1A2: Forms heterotrimers with COL1A1 to produce type I collagen fibrils. Elevated expression is associated with desmoplasia in cancers and is a hallmark of activated fibroblasts in the tumor microenvironment.
+
+COL3A1: Encodes type III collagen, typically co-expressed with COL1A1/1A2. It plays roles in tissue repair and angiogenesis, with high expression linked to stromal activation and wound-healing–like responses in cancer.
+
+COL5A1: Produces type V collagen, regulating fibril formation and collagen fibril diameter. Dysregulation contributes to abnormal ECM architecture and has been implicated in metastasis and poor outcomes in solid tumors.
+
+COL6A2: Encodes part of type VI collagen microfibrils that interact with basement membrane components. Its upregulation is associated with altered cell adhesion, migration, and increased tissue stiffness.
+
+COL6A3: Another subunit of type VI collagen, often linked to stromal remodeling in cancer. It has been implicated in shaping the tumor microenvironment, promoting cancer-associated fibroblast activity, and influencing immune infiltration.
+
+These six collagen genes are the top contributors to PC1, forming a coordinated ECM-remodeling program.
+
+The box plot shows relatively high median expression (10–18 VST scale), but with wide distributions and many outliers, confirming high variance across samples.
+
+The bubble plot demonstrates that this variance organizes samples along PC1:
+
+Low collagen state: Purple dots, clustered to the left.
+
+High collagen state: Yellow dots, to the right.
+
+Intermediate state: Teal, forming a gradient.
+
+This indicates that PC1 reflects coordinated shifts in collagen expression, not random variability. Biologically, this suggests that collagen gene expression represents a shared program of ECM remodeling and fibroblast activation. Given that age was the strongest factor segregating samples, this likely reflects age-associated changes in tissue structure and ECM organization, with older samples showing distinct collagen expression states compared to younger ones.
+
+```{r}
+
+pc2_loadings <- pca_res$rotation[, 2]
+pc2_sorted_loadings <- sort(pc2_loadings, decreasing = TRUE)
+pc2_top_genes <- names(head(pc2_sorted_loadings, n = 6))
+pc2_top_genes_vsd <- data.frame(t(assay(vsd)[pc2_top_genes, ]))
+
+df_long2 <- pc2_top_genes_vsd %>%
+pivot_longer(
+cols = everything(),
+names_to = "Gene",
+values_to = "Expression"
+)
+
+ggplot(df_long2, aes(x = Gene, y = Expression)) +
+geom_boxplot(aes(fill = Gene), alpha = 0.5) +
+geom_jitter(width = 0.2, size = 1, alpha = 0.5) +
+scale_y_continuous(limits = c(0, 21)) +
+labs(title = "Expression of Top Genes in PC2",
+x = "Genes",
+y = "Expression") +
+theme_classic() +
+theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+pc2_loadings <- pca_res$rotation[, 2]
+pc2_sorted_loadings <- sort(pc2_loadings, decreasing = TRUE)
+pc2_top_genes <- names(head(pc2_sorted_loadings, n = 6))
+pc2_top_genes_vsd <- data.frame(t(assay(vsd)[pc2_top_genes, ]))
+
+df_genes_long2 <- data.frame(
+  pc2_top_genes_vsd,  
+  df_pca[, c("PC1", "PC2", "Pathology")]
+)
+
+
+df_long2 <- df_genes_long2 %>%
+  pivot_longer(
+    cols = all_of(pc2_top_genes),  # Only pivot the gene columns
+    names_to = "Gene",
+    values_to = "Expression"
+  )
+
+df_long2$Expression_cat <- cut(df_long2$Expression, 
+                             breaks = quantile(df_long2$Expression, c(0, 0.33, 0.66, 1)), 
+                             labels = c("Low", "Medium", "High"))
+
+ggplot(df_long2, aes(x = PC1, y = PC2, size = Expression, color = Expression_cat)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Low" = "#440154", "Medium" = "#21908C", "High" = "#FDE725")) +
+  scale_size_continuous(range = c(1, 4)) +
+  facet_wrap(~ Gene, ncol = 2) +
+  labs(title = "Gene Expression Bubbles in PC Space",
+       x = "PC1", y = "PC2", color = "Expression Level") +
+  theme_minimal()
+```
+Looking at the plots, here's an updated version of your text with the correct genes:
+CNR1: Cannabinoid receptor 1, primarily expressed in the central nervous system, regulates neurotransmitter release and plays roles in memory, mood, and pain perception.
+COL11A1: Collagen type XI alpha 1 chain, a minor fibrillar collagen that regulates collagen fibril diameter and is often associated with tissue development and remodeling.
+GFAP: Glial fibrillary acidic protein, the hallmark intermediate filament protein in astrocytes, upregulated during astrocyte activation and gliosis.
+GPC4: Glypican 4, a cell surface heparan sulfate proteoglycan that regulates developmental signaling pathways and synaptic development.
+GPM6B: Glycoprotein M6B, a neuronal membrane glycoprotein involved in neuronal differentiation, neurite outgrowth, and synapse formation.
+SOX2: A transcription factor critical for maintaining neural progenitor identity and self-renewal, also involved in reprogramming and stem cell maintenance.
+These six genes (CNR1, COL11A1, GFAP, GPC4, GPM6B, SOX2) are the top contributors to PC2 and show more complex expression patterns compared to what we might expect from coordinated PC1 genes. The box plot reveals varied baseline expression levels across genes - GFAP sits notably lower (around 8) while COL11A1 and GPC4 are higher (around 12) but all maintain substantial variability across samples, confirming their role as high-variance PC2 drivers.
+The bubble plot demonstrates a heterogeneous expression pattern across PC space. Instead of simple left-right segregation, these genes show high expression (yellow) distributed across different PC regions, COL11A1 and GPC4 particularly prominent in upper-right regions, while GFAP shows more scattered high expression patches. Low expression (purple) samples tend to cluster in the lower-left regions. This suggests these genes don't move together as tightly as a coordinated gene set, some can be high while others remain medium or low within the same samples.
+This complex expression pattern indicates PC2 captures a different type of biological variation that's independent of the primary program driving PC1. Since PC2 typically explains less variance than PC1, this represents a secondary source of variation in the dataset, possibly reflecting different cell types (neurons vs. glia), developmental states, or activation patterns that operate independently of the primary biological changes captured by PC1.
+
+
+# Hierarchical Clustering
+
+Another form of EDA. When applied to an RNA-seq dataset, hierarchical clustering can define groups, or clusters, of RNA-seq samples that have similar gene expression profiles. It builds a tree-like structure, a dendrogram, that shows how samples are related and progressively merged into clusters. This is particularly useful for detecting whether samples are related due to shared biology or technical noise.
+
+The below code shows the clustering for the cell lines.But first we need to know the optimal k number first 
+
+```{r}
+high_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 500)
+high_var_mat <- assay(vsd)[high_var_genes,]
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+
+# Test different numbers of clusters
+for(k in 2:6) {
+  clusters <- cutree(hc, k = k)
+  cat("\n=== k =", k, "===\n")
+  cat("Cluster sizes:", table(clusters), "\n")
+  
+  # Check what drives each cluster
+  for(col in c("Site_Primary", "Histology", "type_refined")) {
+    if(col %in% colnames(ccle_meta_subset)) {
+      cluster_table <- table(clusters, ccle_meta_subset[[col]])
+      if(any(cluster_table > 0)) {
+        cat("\n", col, "distribution:\n")
+        print(cluster_table)
+      }
+    }
+  }
+  cat("\n" , rep("=", 50), "\n")
+}
+```
+k = 3 provides the best balance:
+
+Creates reasonably sized, interpretable clusters (8, 12, and 16 samples)
+All clusters have sufficient sample sizes for meaningful analysis
+Avoids the issues seen with other k values
+
+Problems with other k values:
+
+k = 2: Too simplistic - may miss important biological subtypes by forcing all samples into just two groups
+k = 4: Creates two small clusters of only 6 samples each, which may not be statistically robust
+k = 5: Creates a very small cluster with only 2 samples and another with just 4 samples
+k = 6: Even worse - creates clusters with just 1 and 2 samples, which are too small to be meaningful
+
+Why k = 3 works well:
+
+The cluster sizes (8, 12, 16) are all large enough for statistical analysis
+It likely captures the main biological subtypes without over-fragmenting the data
+It's a natural progression from k = 2 that adds meaningful complexity
+The distribution suggests three distinct expression patterns in your gastric cancer samples. 
+
+```{r, fig.height=10, fig.width=8}
+auto_colors <- function(values) {
+  unique_vals <- unique(values)
+  n_colors <- length(unique_vals)
+  
+  # Use a color palette based on number of unique values
+  base_colors <- c("#E41A1C", "#377EB8", "#4DAF4A", "#984EA3", 
+                   "#FF7F00", "#FFFF33", "#A65628", "#F781BF",
+                   "#999999", "#66C2A5", "#FC8D62", "#8DA0CB")
+  
+  if (n_colors <= length(base_colors)) {
+    colors <- base_colors[1:n_colors]
+  } else {
+    colors <- rainbow(n_colors)
+  }
+  
+  names(colors) <- unique_vals
+  
+  # Gray for missing values
+  if ("missing info" %in% unique_vals) {
+    colors["missing info"] <- "#999999"
+  }
+  if (NA %in% unique_vals) {
+    colors[is.na(names(colors))] <- "#CCCCCC"
+  }
+  
+  return(colors)
+}
+
+# Create clusters
+clusters <- cutree(hc, k = 3)
+
+# Select annotation columns
+sample_annotation_df <- ccle_meta_subset %>% 
+  dplyr::select(tcga_code, Race, Pathology)
+
+# Automatically generate colors for each annotation
+sample_annotation_colors <- list(
+  tcga_code = auto_colors(sample_annotation_df$tcga_code),
+  Race = auto_colors(sample_annotation_df$Race),
+  Pathology = auto_colors(sample_annotation_df$Pathology)
+)
+
+# Create annotation object
+column_annotation <- HeatmapAnnotation(
+  df = sample_annotation_df,
+  col = sample_annotation_colors,
+  show_annotation_name = TRUE,
+  annotation_name_side = "left"
+)
+
+# Create heatmap
+Heatmap(high_var_mat,
+        clustering_distance_columns = "euclidean",
+        clustering_method_columns = "complete",
+        clustering_distance_rows = "euclidean",
+        clustering_method_rows = "complete",
+        show_row_names = FALSE,
+        show_column_names = FALSE,
+        name = "VST_Counts",
+        column_split = clusters,
+        top_annotation = column_annotation)
+```
+```{r}
+
+pca_res <- prcomp(t(high_var_mat), center = TRUE, scale = FALSE)
+explained_variance <- pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+df_pca <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2], ccle_meta_subset)
+high_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+high_var_mat <- assay(vsd)[high_var_genes,]
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+clusters <- cutree(hc, k = 3)
+df_pca$Cluster <- factor(clusters)
+
+ggplot(df_pca, aes(x = PC1, y = PC2, color = Cluster)) +
+  geom_point(size = 3, alpha = 0.5) +
+  scale_color_manual(values = hue_pal()(length(unique(clusters)))) +
+  theme_classic() +
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Cluster")
+
+```
+# Differential Expression Analysis
+
+```{r}
+# Gene Expression Clustering and Differential Expression Analysis
+# This code performs hierarchical clustering on high-variance genes and identifies 
+# differentially expressed genes (DEGs) between clusters
+
+# Step 1: Identify the top 500 most variable genes
+# rowVars() calculates variance for each gene (row) across all samples
+# order() ranks genes by variance in descending order
+# head() selects the top 500 highest variance genes
+high_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 50)
+
+# Step 2: Extract expression data for high-variance genes only
+# Creates a matrix containing only the 500 most variable genes
+# assay(vsd) extracts the normalized expression matrix from the vsd object
+high_var_mat <- assay(vsd)[high_var_genes,]
+
+# Step 3: Perform hierarchical clustering on samples (columns)
+# t() transposes the matrix so samples become rows for clustering
+# dist() calculates Euclidean distances between samples
+# hclust() performs hierarchical clustering using complete linkage method
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+
+# Step 4: Cut the dendrogram to create 2 clusters
+# cutree() divides the hierarchical tree into k=2 groups
+# Returns cluster assignments for each sample
+clusters <- cutree(hc, k = 2)
+
+# Step 5: Add cluster assignments to metadata
+# Converts cluster numbers to factors and stores in metadata object
+ccle_meta_subset$Cluster <- factor(clusters)
+
+# Step 6: Separate expression data by cluster
+# Extract all genes' expression data for samples in each cluster
+cluster_1_data <- assay(vsd)[, ccle_meta_subset$Cluster == 1]
+cluster_2_data <- assay(vsd)[, ccle_meta_subset$Cluster == 2]
+
+# Step 7: Calculate mean expression for each gene in each cluster
+# rowMeans() computes average expression across samples for each gene
+mean_cluster_1 <- rowMeans(cluster_1_data)
+mean_cluster_2 <- rowMeans(cluster_2_data)
+
+# Step 8: Calculate log2 fold change between clusters
+# log2FC = log2(cluster_2_mean / cluster_1_mean)
+# Adding 1 to avoid log(0) issues (pseudocount)
+# Positive values indicate higher expression in cluster 2
+# Negative values indicate higher expression in cluster 1
+log2FC <- log2((mean_cluster_2 + 1) / (mean_cluster_1 + 1))
+
+# Step 9: Create histogram of log2 fold change distribution
+# Visualizes the distribution of differential expression between clusters
+ggplot(data.frame(log2FC = log2FC), aes(x = log2FC)) +
+  geom_histogram(bins = 30, fill = "skyblue", color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(x = "Log2FC", y = "Frequency", title = "Log2FC Distribution")
+
+# Step 10: Create comprehensive results dataframe
+# Combines gene names, mean expression levels, and fold changes
+degs_df <- data.frame(
+  gene = rownames(assay(vsd)),                    # Gene identifiers
+  mean_expression = (mean_cluster_1 + mean_cluster_2) / 2,  # Overall mean expression
+  log2FC = log2FC                                 # Log2 fold change values
+)
+
+# Step 11: Rank genes by absolute fold change magnitude
+# order() with abs() ranks by largest absolute log2FC values
+# This identifies genes with the biggest expression differences (up or down)
+degs_ranking <- order(abs(degs_df$log2FC), decreasing = TRUE)
+
+# Step 12: Extract top 20 differentially expressed genes
+# Selects the 20 genes with largest absolute fold changes
+top_degs <- degs_df[degs_ranking, ][1:20, ]
+
+# Step 13: Display results
+# Prints the top 20 DEGs with their expression statistics
+print(top_degs)
+```
+
+```{r}
+cluster_1_degs <- degs_df[degs_df$log2FC > 0, ]
+cluster_1_degs <- cluster_1_degs[order(abs(cluster_1_degs$log2FC), decreasing = TRUE), ]
+top_3_cluster_1 <- cluster_1_degs[1:3, ]
+
+print("Top 3 DEGs higher in Cluster 1:")
+print(top_3_cluster_1)
+
+cluster_2_up <- degs_df[degs_df$log2FC < 0, ]
+cluster_2_up <- cluster_2_up[order(abs(cluster_2_up$log2FC), decreasing = TRUE), ]
+top_3_cluster_2 <- cluster_2_up[1:3, ]
+
+
+print("Top 3 DEGs higher in Cluster 2:")
+print(top_3_cluster_2)
+```
+
+```{r}
+high_var_genes <- head(order(rowVars(assay(vsd)), decreasing = TRUE), 500)
+high_var_mat <- assay(vsd)[high_var_genes,]
+
+hc <- hclust(dist(t(high_var_mat)), method = "complete")
+clusters <- cutree(hc, k = 3)
+ccle_meta_subset$Cluster <- factor(clusters)
+
+dds <- DESeqDataSetFromMatrix(countData = data.frame(ccle_counts_subset),
+                              colData = ccle_meta_subset,
+                              design = ~ Cluster)
+dds$Cluster <- relevel(dds$Cluster, ref = "3")
+dds <- dds[rowSums(counts(dds)) >= 100,]
+dds <- DESeq(dds)
+
+res <- results(dds)
+res_reordered <- res %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "gene_symbol") %>%
+  filter(padj < 0.001) %>%
+  arrange(desc(abs(log2FoldChange)))
+
+degs <- c("COL1A2", "COL3A1", "CXCL12", "CYFIP2", "ARHGEF4", "FREM2")
+degs_vsd <- data.frame(t(assay(vsd)[degs, ]))
+
+variances <- rowVars(assay(vsd))
+top_var_genes <- order(variances, decreasing = TRUE)[1:500]
+high_var_mat <- assay(vsd)[top_var_genes,]
+pca_res <- prcomp(t(high_var_mat), center = TRUE, scale = FALSE)
+df_pca <- data.frame(PC1 = pca_res$x[, 1], PC2 = pca_res$x[, 2], ccle_meta_subset)
+
+df_genes_long <- data.frame(
+  degs_vsd,
+  df_pca[, c("PC1", "PC2", "tcga_code")]
+)
+
+df_long <- pivot_longer(
+  df_genes_long,
+  cols = all_of(degs),
+  names_to = "Gene",
+  values_to = "Expression"
+)
+
+ggplot(df_long, aes(x = PC1, y = PC2, color = Expression)) +
+  geom_point(size = 2, alpha = 0.5) +
+  scale_color_gradient(low = "gold", high = "magenta") +
+  theme_classic() +
+  labs(x = paste0("PC1: ", round(explained_variance[1], 1), "% variance"), 
+       y = paste0("PC2: ", round(explained_variance[2], 1), "% variance"),
+       color = "Expression (VST)") +
+  facet_wrap(~ Gene)
+```
+
+```{r}
+# Get top upregulated and downregulated genes
+top_degs_up <- res_reordered %>%
+  arrange(desc(log2FoldChange)) %>%
+  head(10)
+
+top_degs_down <- res_reordered %>%
+  arrange(log2FoldChange) %>%
+  head(10)
+
+genes <- c(top_degs_up$gene, top_degs_down$gene)
+
+# Create volcano plot with arrows pointing to labeled genes
+EnhancedVolcano(res_reordered,                    
+  x = "log2FoldChange",                           
+  y = "padj",                                     
+  lab = res_reordered$gene,                       
+  selectLab = genes,                              # Only label these genes
+  pCutoff = 0.00001,                             
+  FCcutoff = 2,                                  
+  labSize = 3,                                   
+  pointSize = 1.5,                               
+  colAlpha = 0.5,                                
+  # Arrow/connector parameters
+  drawConnectors = TRUE,                          # Enable arrows/connectors
+  widthConnectors = 0.5,                         # Arrow line thickness
+  colConnectors = "black",                       # Arrow color
+  lengthConnectors = unit(0.01, "npc"),         # Arrow length
+  typeConnectors = "open",                       # Arrow type: "closed", "open", or "straight"
+  endsConnectors = "last",                       # Where arrow points: "last", "first", "both"
+  # Label positioning
+  max.overlaps = Inf,                           # Allow all labels (prevent hiding)
+  title = "Cluster 1 vs Cluster 2 DEGs",        
+  subtitle = "",                                 
+  caption = ""                                   
+) +
+  theme_classic() +                              
+  theme(legend.position = "none")
+```
+# Interpretation
+
+How many biologically distinct groups of central nervous system cancer cell lines did you define? What do the gene expression profiles of each group tell us about the biology of each group?
+
+We defined three biologically distinct groups of central nervous system (CNS) cancer cell lines using hierarchical clustering on high-variance genes. The clusters contained 37, 19, and 7 samples, respectively
+
+Group 1 (PC1-high cluster, 37 samples):
+Characterized by higher expression of the PC1 top genes, which were six collagens (COL1A1, COL1A2, COL3A1, COL5A1, COL6A2, COL6A3)
+. This group separates along the primary axis of variation in the dataset.
+
+Group 2 (PC2-high cluster, 19 samples):
+Distinguished by higher expression of the PC2 top genes, including GFAP, SOX2, GPM6B, GPC4, CNR1, and COL11A1
+. These are mostly neural/glial markers, indicating that this group aligns with CNS-specific transcriptional programs.
+
+Group 3 (Intermediate cluster, 7 samples):
+Shows lower or more balanced expression of both PC1 and PC2 gene sets. It does not strongly enrich for either the collagen-driven or the neural/glial-driven profiles, representing a mixed or intermediate state relative to the other two groups.
+
+Three distinct CNS cancer cell line groups were defined. One group is driven by high expression of collagen genes, one by neural/glial markers, and one is intermediate between these extremes.
