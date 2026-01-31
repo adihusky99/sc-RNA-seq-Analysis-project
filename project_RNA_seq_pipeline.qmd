@@ -670,7 +670,6 @@ ggplot(df_long2, aes(x = PC1, y = PC2, size = Expression, color = Expression_cat
        x = "PC1", y = "PC2", color = "Expression Level") +
   theme_minimal()
 ```
-Looking at the plots, here's an updated version of your text with the correct genes:
 CNR1: Cannabinoid receptor 1, primarily expressed in the central nervous system, regulates neurotransmitter release and plays roles in memory, mood, and pain perception.
 COL11A1: Collagen type XI alpha 1 chain, a minor fibrillar collagen that regulates collagen fibril diameter and is often associated with tissue development and remodeling.
 GFAP: Glial fibrillary acidic protein, the hallmark intermediate filament protein in astrocytes, upregulated during astrocyte activation and gliosis.
